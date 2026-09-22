@@ -1,0 +1,31 @@
+# Racket bytecode and build output
+compiled/
+*.zo
+*.dep
+*.rktd.tmp
+
+# raco setup / doc build output
+doc/
+/scribblings/compiled/
+
+# raco exe / distribute output
+/dist/
+*.exe
+
+# Package install artifacts
+.racket/
+
+# Credentials — jev talks to a real API; never commit a key
+.env
+.env.*
+*.pem
+secrets.rkt
+
+# Editor / OS noise
+*~
+\#*\#
+.\#*
+*.bak
+.DS_Store
+.vscode/
+.idea/
