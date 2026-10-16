@@ -194,3 +194,92 @@
     (lambda (m c)
       (check-exn #px"must not be blank" (lambda () (ask c "  " QS)))
       (check-equal? (mock-count m) 0 "nothing was sent"))))
+
+;; ---- the new wire: order, images, compression, headers ---------------------------
+
+(require file/gunzip "../private/asset.rkt")
+
+(define (gunzip-body bs)
+  (define out (open-output-bytes))
+  (gunzip-through-ports (open-input-bytes bs) out)
+  (get-output-bytes out))
+
+(test-case "question and option order reaches the wire as the author wrote it"
+  (with-mock ok-always
+    (lambda (m c)
+      (ask c "x" (list (cons "zz_first" (noul "a"))
+                       (cons "aa_second" (choice "q" '(("zebra" . #f) ("apple" . #f))))))
+      (define body (recorded-body (first (mock-requests m))))
+      (define (pos s) (car (car (regexp-match-positions (regexp (regexp-quote s)) body))))
+      (check-true (< (pos "zz_first") (pos "aa_second")))
+      (check-true (< (pos "zebra") (pos "apple"))))))
+
+(test-case "a client or per-call header rides every request — the image opt-in's path"
+  (with-mock ok-always
+    (lambda (m c0)
+      (define c (make-client #:api-key "k" #:base-url (mock-url m) #:retry (fast)
+                             #:headers '(("TypeSafe-Danger-Zone-Images" . "true"))))
+      (ask c "x" QS #:headers '(("X-Case" . "per-call")))
+      (define hs (recorded-headers (first (mock-requests m))))
+      (check-equal? (cdr (assoc "typesafe-danger-zone-images" hs)) "true")
+      (check-equal? (cdr (assoc "x-case" hs)) "per-call"))))
+
+(test-case "an image makes the request multipart: the JSON names the part that carries the bytes"
+  (define png (bytes-append #"\211PNG\r\n\32\n" (make-bytes 16 0)))
+  (with-mock ok-always
+    (lambda (m c)
+      (define photo (image png))
+      (ask c (hasheq 'photo photo)
+           (hash "mug" (locate "the coffee mug in `photo`"))
+           #:assets (list (cons "photo" photo)))
+      (define req (first (mock-requests m)))
+      (define hs (recorded-headers req))
+      (check-true (string-prefix? (cdr (assoc "content-type" hs)) "multipart/form-data; boundary=")
+                  "the content type switched to multipart")
+      (define body (recorded-body-bytes req))
+      ;; the JSON part names the asset and its part...
+      (define jm (regexp-match #px#"name=\"request\"\r\nContent-Type: application/json\r\n\r\n(.*?)\r\n--" body))
+      (check-true (and jm #t) "the first part is the JSON, named request")
+      (define sent (string->jsexpr (bytes->string/utf-8 (cadr jm))))
+      (check-equal? (hash-ref sent 'assets)
+                    (hasheq 'photo (hasheq 'type "image" 'part "asset-0")))
+      (check-equal? (hash-ref sent 'state) (hasheq 'photo "photo")
+                    "the aliased image serializes as its id")
+      ;; ...and the bytes ride in that part, verbatim
+      (check-true (regexp-match? #px#"name=\"asset-0\"" body))
+      (check-true (regexp-match? #px#"Content-Type: image/png" body))
+      (check-true (regexp-match? (byte-regexp png) body)))))
+
+(test-case "an anonymous image is collected under its reference"
+  (define jpg (bytes-append #"\377\330\377" (make-bytes 16 0)))
+  (with-mock ok-always
+    (lambda (m c)
+      (define photo (image jpg))
+      (ask c (hasheq 'photo photo) (hash "is_cat" (noul "Is `photo` a cat?")))
+      (define body (recorded-body-bytes (first (mock-requests m))))
+      (define jm (regexp-match #px#"name=\"request\"\r\nContent-Type: application/json\r\n\r\n(.*?)\r\n--" body))
+      (define sent (string->jsexpr (bytes->string/utf-8 (cadr jm))))
+      (define ref (string->symbol (image-reference photo)))
+      (check-equal? (hash-ref sent 'state) (hasheq 'photo (image-reference photo)))
+      (check-equal? (hash-ref (hash-ref sent 'assets) ref)
+                    (hasheq 'type "image" 'part "asset-0")))))
+
+(test-case "a body of 1 KiB or more goes out gzipped; a small one does not"
+  (with-mock ok-always
+    (lambda (m c)
+      (ask c (make-string 2048 #\x) QS)
+      (define req (first (mock-requests m)))
+      (check-equal? (cdr (assoc "content-encoding" (recorded-headers req))) "gzip")
+      (define sent (string->jsexpr (bytes->string/utf-8 (gunzip-body (recorded-body-bytes req)))))
+      (check-equal? (string-length (hash-ref sent 'state)) 2048)
+      ;; a small body is identity-encoded — below one TCP segment there is
+      ;; nothing to win
+      (ask c "small" QS)
+      (check-false (assoc "content-encoding" (recorded-headers (second (mock-requests m))))))))
+
+(test-case "#:compress? #f turns compression off however large the body"
+  (with-mock ok-always
+    (lambda (m c0)
+      (define c (make-client #:api-key "k" #:base-url (mock-url m) #:retry (fast) #:compress? #f))
+      (ask c (make-string 2048 #\x) QS)
+      (check-false (assoc "content-encoding" (recorded-headers (first (mock-requests m))))))))

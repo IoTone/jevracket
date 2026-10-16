@@ -8,7 +8,7 @@
 
 (define collection "jev")
 (define pkg-desc "Racket client for the TypeSafe System One (Jev) API: typed questions, calibrated answers")
-(define version "0.1.0")
+(define version "0.2.0")
 (define pkg-authors '("IoTone, Inc."))
 (define license 'MIT)
 

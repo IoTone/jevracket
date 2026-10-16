@@ -11,10 +11,14 @@
 (require racket/tcp racket/port racket/string racket/list)
 
 (provide start-mock! mock-stop! mock-url mock-port mock-requests mock-count
+         recorded-method recorded-path recorded-headers recorded-body
          (struct-out recorded))
 
-;; method/path/headers as they arrived; body as a string
-(struct recorded (method path headers body) #:transparent)
+;; method/path/headers as they arrived; body as BYTES, because a compressed or
+;; multipart body is not text. `recorded-body` answers it as a string for the
+;; JSON cases, which is what most assertions read.
+(struct recorded (method path headers body-bytes) #:transparent)
+(define (recorded-body r) (bytes->string/utf-8 (recorded-body-bytes r) #\?))
 
 ;; `stopper` rather than `stop!`, so the accessor does not collide with the
 ;; procedure callers actually want.
@@ -59,10 +63,12 @@
           (if (or (eof-object? l) (string=? (string-trim l) "")) (reverse acc)
               (loop (cons (parse-header l) acc)))))
       (define len (cond [(assoc "content-length" hs) => (lambda (p) (string->number (cdr p)))] [else 0]))
-      (define body (if (and len (> len 0)) (read-string len in) ""))
+      ;; bytes, not read-string: Content-Length counts bytes, and a multipart or
+      ;; gzipped body is binary
+      (define body (if (and len (> len 0)) (read-bytes len in) #""))
       (define r (recorded (if (pair? parts) (car parts) "")
                           (if (> (length parts) 1) (cadr parts) "")
-                          hs (if (string? body) body "")))
+                          hs (if (bytes? body) body #"")))
       (define n (length (unbox reqs)))
       (set-box! reqs (cons r (unbox reqs)))
       (cond

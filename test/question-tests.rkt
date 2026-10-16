@@ -7,7 +7,7 @@
 ;; changes a field name these fail, which is the point.
 ;;   raco test test/question-tests.rkt
 
-(require rackunit racket/string json "../private/question.rkt")
+(require rackunit racket/string json "../private/question.rkt" "../private/jsonw.rkt" "../private/asset.rkt")
 
 ;; ---- noul ---------------------------------------------------------------------
 (test-case "noul: bare instructions serialize as the docs show"
@@ -68,11 +68,11 @@
                         'instructions "How frustrated is the customer?"
                         'criteria '("Calm" "Frustrated" "Very angry"))))
 
-(test-case "score: 2 to 10 levels, per the published range"
+(test-case "score: 1 to 10 levels — the API accepts a single level since 0.6, though two is where a score means anything"
   (define (levels n) (for/list ([i (in-range n)]) (format "level ~a" i)))
   (check-not-exn (lambda () (score "q" (levels MIN-SCORE-LEVELS))))
   (check-not-exn (lambda () (score "q" (levels MAX-SCORE-LEVELS))))
-  (check-exn #px"at least 2 levels" (lambda () (score "q" (levels 1))))
+  (check-exn #px"at least 1 level" (lambda () (score "q" (levels 0))))
   (check-exn #px"at most 10 levels" (lambda () (score "q" (levels 11))))
   ;; a hash would lose the ordering that IS the scale
   (check-exn #px"list of level descriptions" (lambda () (score "q" (hash "a" "b")))))
@@ -87,7 +87,7 @@
 
 (test-case "instructions are refused when blank or unencodable"
   (check-exn #px"must not be blank" (lambda () (noul "   ")))
-  (check-exn #px"string, object or array" (lambda () (noul 42)))
+  (check-exn #px"string, object, array or image" (lambda () (noul 42)))
   (check-exn #px"must not be an empty object" (lambda () (noul (hasheq))))
   (check-exn #px"JSON-encodable" (lambda () (noul (list (lambda (x) x))))))
 
@@ -102,6 +102,63 @@
   (check-exn #px"at least one question" (lambda () (questions->jsexpr (hash))))
   (check-exn #px"must be strings" (lambda () (questions->jsexpr (list (cons 'sym (noul "q"))))))
   (check-exn #px"must not be blank" (lambda () (questions->jsexpr (list (cons "" (noul "q"))))))
-  (check-exn #px"noul, choice or score" (lambda () (questions->jsexpr (hash "a" "not a question"))))
+  (check-exn #px"noul, choice, score or locate" (lambda () (questions->jsexpr (hash "a" "not a question"))))
   (check-exn #px"duplicate question id"
              (lambda () (questions->jsexpr (list (cons "a" (noul "q")) (cons "a" (noul "r")))))))
+
+;; ---- optional instructions (SDK 0.7.x) ------------------------------------------
+(test-case "instructions are optional when the criteria carry the question"
+  ;; a noul carried entirely by a described outcome
+  (check-equal? (question->jsexpr (noul #:yes "the invoice is past its due date"))
+                (hasheq 'type "noul"
+                        'criteria (hasheq 'true "the invoice is past its due date" 'false 'null))
+                "no instructions key at all when none was given")
+  ;; a choice or score may ride on its criteria alone
+  (check-not-exn (lambda () (choice #f '(("a" . "first") ("b" . "second")))))
+  (check-not-exn (lambda () (score #f '("Calm" "Furious"))))
+  (check-false (hash-has-key? (question->jsexpr (choice #f '(("a" . #f)))) 'instructions))
+  ;; but a noul with NEITHER has no question in it at all
+  (check-exn #px"instructions or at least one described outcome" (lambda () (noul)))
+  (check-exn #px"instructions or at least one described outcome" (lambda () (noul #f))))
+
+;; ---- structured descriptions (API 0.6+: criteria take objects and arrays) -------
+(test-case "criteria descriptions and score levels accept structured content"
+  (define rubric (hasheq 'tone "hostile" 'examples '("x" "y")))
+  (check-equal? (hash-ref (hash-ref (question->jsexpr (choice "q" (list (cons "angry" rubric)
+                                                                        (cons "calm" "no heat"))))
+                                    'criteria)
+                          'angry)
+                rubric)
+  (check-equal? (hash-ref (question->jsexpr (noul "q" #:yes rubric)) 'criteria)
+                (hasheq 'true rubric 'false 'null))
+  (check-equal? (hash-ref (question->jsexpr (score "q" (list "low" rubric))) 'criteria)
+                (list "low" rubric)))
+
+;; ---- locate (the Box primitive) --------------------------------------------------
+(test-case "locate serializes as the box type the wire documents"
+  (check-equal? (question->jsexpr (locate "the coffee mug in `photo`"))
+                (hasheq 'type "box" 'instructions "the coffee mug in `photo`"))
+  ;; no criteria, ever; instructions optional like everything else now
+  (check-equal? (question->jsexpr (locate)) (hasheq 'type "box"))
+  (check-not-exn (lambda () (questions->jsexpr (hash "mug" (locate "the mug"))))))
+
+;; ---- order is part of the question (the wire writer) -----------------------------
+(define (pos* s needle) (car (car (regexp-match-positions (regexp (regexp-quote needle)) s))))
+(test-case "the wire form keeps the author's option and question order"
+  ;; jsexpr cannot carry key order; the jobj writer can, and the model sees it —
+  ;; measured on the open-weight checkpoint, reordering options moved a
+  ;; probability by 0.54
+  (define q (choice "q" '(("zebra" . "z") ("apple" . "a") ("mango" . "m"))))
+  (define wire (content->json (question->jobj q) (make-hasheq) (box '())))
+  (define (pos s) (car (car (regexp-match-positions (regexp (regexp-quote s)) wire))))
+  (check-true (< (pos "zebra") (pos "apple") (pos "mango"))
+              "options serialize in the order the author wrote them")
+  (define qs (questions->jobj (list (cons "second_look" (noul "b"))
+                                    (cons "first_look" (noul "a")))))
+  (define qwire (content->json qs (make-hasheq) (box '())))
+  (check-true (< (pos* qwire "second_look") (pos* qwire "first_look"))
+              "the questions map serializes in the order the caller listed them"))
+
+(test-case "non-finite numbers serialize as the strings the API's SDKs send"
+  (check-equal? (content->json (list +inf.0 -inf.0 +nan.0 1.5) (make-hasheq) (box '()))
+                "[\"Infinity\",\"-Infinity\",\"NaN\",1.5]"))

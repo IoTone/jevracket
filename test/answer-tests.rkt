@@ -143,12 +143,16 @@ JSON
                  (lambda () (parse "{\"model\":\"m\",\"answers\":{\"t\":{\"type\":\"score\",\"score\":1.0,\"legend\":{\"0\":\"low\"},\"probabilities\":{\"0\":0.5,\"1\":0.5},\"confidence\":0.9}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}")))
                 "answers.t.legend.1"))
 
-(test-case "an unknown answer type is refused rather than guessed at"
-  ;; a future primitive should fail loudly on an old client, the same call the
-  ;; workflow engine makes when it rejects an unknown step kind
-  (check-equal? (field-path-of
-                 (lambda () (parse "{\"model\":\"m\",\"answers\":{\"t\":{\"type\":\"vibes\",\"vibes\":1}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}")))
-                "answers.t.type"))
+(test-case "an unknown answer type is skipped, and the rest of the response survives"
+  ;; the vendor SDK's forward-compatibility rule: a new primitive arrives beside
+  ;; answers you asked for by name, and failing the whole response over the one
+  ;; you could not have constructed would take the readable ones down with it.
+  ;; The raw body is still there via ask/raw. A malformed KNOWN type still
+  ;; raises — that is a broken contract, not a new feature.
+  (define r (parse "{\"model\":\"m\",\"answers\":{\"t\":{\"type\":\"vibes\",\"vibes\":1},\"ok\":{\"type\":\"noul\",\"noul\":0.5}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"))
+  (check-equal? (response-ids r) '("ok") "the unknown answer is not listed")
+  (check-equal? (answer-value (response-ref r "ok")) 0.5)
+  (check-exn #px"no answer named" (lambda () (response-ref r "t"))))
 
 (test-case "a wrongly-typed field is as bad as a missing one"
   (check-equal? (field-path-of
@@ -158,3 +162,59 @@ JSON
                  (lambda () (parse "{\"model\":\"m\",\"answers\":{\"t\":{\"type\":\"score\",\"score\":1.0,\"legend\":{\"x\":\"low\"},\"probabilities\":{\"0\":1.0},\"confidence\":0.9}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}")))
                 "answers.t.legend.x"
                 "a level key that is not an index is malformed"))
+
+;; ---- box (SDK 0.7.5) ------------------------------------------------------------
+
+(define BOX-RESPONSE #<<JSON
+{
+  "model": "jev-1.14.0",
+  "answers": {
+    "mug": {
+      "type": "box",
+      "box": { "top": 0.21, "bottom": 0.56, "left": 0.4, "right": 0.62 },
+      "confidence": 0.93
+    }
+  },
+  "usage": { "input_tokens": 412, "output_tokens": 0 }
+}
+JSON
+  )
+
+(test-case "box: the located region arrives as fractions of the image"
+  (define a (response-ref (parse BOX-RESPONSE) "mug"))
+  (check-true (box-answer? a))
+  (check-equal? (answer-type a) 'box)
+  (define r (box-answer-value a))
+  (check-equal? (box-region-top r) 0.21)
+  (check-equal? (box-region-bottom r) 0.56)
+  (check-equal? (box-region-left r) 0.4)
+  (check-equal? (box-region-right r) 0.62)
+  (check-equal? (answer-value a) r "the generic accessor answers the region")
+  (check-equal? (answer-confidence a) 0.93)
+  (check-false (answer-probabilities a)))
+
+(test-case "box: a null confidence is #f — the one answer type where the wire allows it"
+  (define a (response-ref (parse "{\"model\":\"m\",\"answers\":{\"mug\":{\"type\":\"box\",\"box\":{\"top\":0.1,\"bottom\":0.2,\"left\":0.3,\"right\":0.4},\"confidence\":null}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}") "mug"))
+  (check-false (box-answer-confidence a))
+  (check-false (answer-confidence a)))
+
+(test-case "box: a missing edge raises with the path, like every known type"
+  (check-equal? (field-path-of
+                 (lambda () (parse "{\"model\":\"m\",\"answers\":{\"mug\":{\"type\":\"box\",\"box\":{\"top\":0.1,\"bottom\":0.2,\"left\":0.3}}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}")))
+                "answers.mug.box.right"))
+
+;; ---- usage may be partial (SDK 0.7.x) ---------------------------------------------
+
+(test-case "usage counts the API did not report are #f, not an error"
+  (define r (parse "{\"model\":\"m\",\"answers\":{\"a\":{\"type\":\"noul\",\"noul\":0.5}},\"usage\":{}}"))
+  (check-false (usage-input-tokens (response-usage r)))
+  (check-false (usage-output-tokens (response-usage r)))
+  (define r2 (parse "{\"model\":\"m\",\"answers\":{\"a\":{\"type\":\"noul\",\"noul\":0.5}},\"usage\":{\"input_tokens\":null,\"output_tokens\":7}}"))
+  (check-false (usage-input-tokens (response-usage r2)))
+  (check-equal? (usage-output-tokens (response-usage r2)) 7))
+
+;; ---- a structured legend echoes structured criteria (API 0.6+) --------------------
+
+(test-case "a legend value may be the structured level the caller sent"
+  (define a (response-ref (parse "{\"model\":\"m\",\"answers\":{\"s\":{\"type\":\"score\",\"score\":0.5,\"legend\":{\"0\":\"calm\",\"1\":{\"tone\":\"hostile\"}},\"probabilities\":{\"0\":0.5,\"1\":0.5},\"confidence\":0.6}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}") "s"))
+  (check-equal? (hash-ref (score-answer-legend a) 1) (hasheq 'tone "hostile")))
