@@ -2,11 +2,11 @@
 
 ;; private/answer.rkt — typed answers, parsed strictly.
 ;;
-;; Three answer structs mirroring the three question types, plus three generic
+;; Four answer structs mirroring the four question types, plus three generic
 ;; accessors (`answer-value`, `answer-confidence`, `answer-probabilities`) so a
 ;; caller that routes on confidence does not have to dispatch on the type first.
 ;;
-;; Two places this is deliberately NOT a transcription of the wire:
+;; Places this is deliberately NOT a transcription of the wire:
 ;;
 ;;   • A Score's `legend` and `probabilities` come back keyed by level index as
 ;;     JSON STRINGS ("0", "1", "2"). They are integers — they index an ordered
@@ -16,6 +16,13 @@
 ;;   • A Choice's probability keys stay STRINGS, because they are option names the
 ;;     caller chose. Handing back the symbols that `read-json` happens to produce
 ;;     would be an artifact of the parser, not part of the contract.
+;;   • An answer whose `type` this client does not know is SKIPPED with a logged
+;;     warning, not raised — the vendor SDK's forward-compatibility rule. A new
+;;     primitive arrives beside answers you asked for by name; failing the whole
+;;     response over the one you could not have constructed would take the
+;;     answers you CAN read down with it. The raw body is still there via
+;;     ask/raw. (An answer of a KNOWN type that is malformed still raises — that
+;;     is a broken contract, not a new feature.)
 ;;
 ;; Everything else is strict. A 2xx that is missing `confidence`, or names a
 ;; `choice` that is not in its own distribution, raises exn:fail:jev:response with
@@ -28,13 +35,17 @@
          (struct-out noul-answer)
          (struct-out choice-answer)
          (struct-out score-answer)
+         (struct-out box-answer)
+         (struct-out box-region)
          (struct-out usage)
          (struct-out response)
          answer-value answer-confidence answer-probabilities
          response-ref response-ids
          parse-response)
 
-;; type : 'noul | 'choice | 'score
+(define-logger jev)
+
+;; type : 'noul | 'choice | 'score | 'box
 (struct answer (type) #:transparent)
 
 ;; value : real in [0,1] — the probability that the answer is YES. Not a boolean:
@@ -49,11 +60,24 @@
 
 ;; value         : real, probability-weighted across levels; MAY land between two
 ;;                 of them (1.05 means "mostly level 1, leaning 2")
-;; legend        : hash exact-nonnegative-integer -> string
+;; legend        : hash exact-nonnegative-integer -> the level description as the
+;;                 caller sent it (a string, or structured content echoed back)
 ;; probabilities : hash exact-nonnegative-integer -> real
 ;; confidence    : real in [0,1]
 (struct score-answer answer (value legend probabilities confidence) #:transparent)
 
+;; The edges of the located box, each a fraction of the image from 0 to 1:
+;; top/bottom of its height, left/right of its width; top < bottom, left < right.
+(struct box-region (top bottom left right) #:transparent)
+
+;; value      : box-region
+;; confidence : real in [0,1], or #f — the wire allows null here, unlike the
+;;              other types, so #f means "the model did not say", not zero
+(struct box-answer answer (value confidence) #:transparent)
+
+;; Token counts, or #f where the API did not report one — unlike an answer
+;; field, a missing count is the API being honest about not metering, so it is
+;; #f rather than a raised contract violation.
 (struct usage (input-tokens output-tokens) #:transparent)
 
 ;; model   : the VERSIONED id that answered, e.g. "jev-1.13.0", even when the
@@ -79,22 +103,26 @@
   (cond [(noul-answer? a)   (noul-answer-value a)]
         [(choice-answer? a) (choice-answer-value a)]
         [(score-answer? a)  (score-answer-value a)]
+        [(box-answer? a)    (box-answer-value a)]
         [else (raise-argument-error 'answer-value "answer?" a)]))
 
 ;; #f for a Noul, and that is the API's shape, not an omission here: a Noul's
 ;; probability already IS its own certainty, so there is no second number to
-;; report. Callers that gate on confidence should treat #f as "not applicable"
-;; rather than as "unconfident".
+;; report. A Box's confidence may be #f too — there the wire says null. Callers
+;; that gate on confidence should treat #f as "not applicable" rather than as
+;; "unconfident".
 (define (answer-confidence a)
   (cond [(noul-answer? a)   #f]
         [(choice-answer? a) (choice-answer-confidence a)]
         [(score-answer? a)  (score-answer-confidence a)]
+        [(box-answer? a)    (box-answer-confidence a)]
         [else (raise-argument-error 'answer-confidence "answer?" a)]))
 
 (define (answer-probabilities a)
   (cond [(noul-answer? a)   #f]
         [(choice-answer? a) (choice-answer-probabilities a)]
         [(score-answer? a)  (score-answer-probabilities a)]
+        [(box-answer? a)    #f]
         [else (raise-argument-error 'answer-probabilities "answer?" a)]))
 
 ;; ---- parsing ------------------------------------------------------------------
@@ -127,6 +155,14 @@
   (unless (hash? v) (fail c (join path key)))
   v)
 
+;; a real, or #f where the field is absent or JSON null — for the fields whose
+;; contract says "when reported"
+(define (optional-real c h key path)
+  (define v (if (hash? h) (hash-ref h key 'null) 'null))
+  (cond [(eq? v 'null) #f]
+        [(real? v) v]
+        [else (fail c (join path key))]))
+
 ;; symbol-keyed jsexpr object -> hash string -> real
 (define (prob-hash c h path)
   (for/hash ([(k v) (in-hash h)])
@@ -140,6 +176,10 @@
     (unless (exact-nonnegative-integer? n) (fail c (string-append path "." (symbol->string k))))
     (unless (check v) (fail c (string-append path "." (symbol->string k))))
     (values n v)))
+
+;; a legend value echoes the level the caller sent, which since the 0.6 API may
+;; be structured content, not only a string
+(define (legend-value? v) (or (string? v) (hash? v) (list? v)))
 
 (define (parse-answer c id a)
   (define path (string-append "answers." id))
@@ -157,7 +197,7 @@
      (choice-answer 'choice chosen probs (need-real c a 'confidence path))]
     [("score")
      (define legend (level-hash c (need-hash c a 'legend path)
-                                (string-append path ".legend") string?))
+                                (string-append path ".legend") legend-value?))
      (define probs (level-hash c (need-hash c a 'probabilities path)
                                (string-append path ".probabilities") real?))
      ;; Every level that has a probability must have a description, or the number
@@ -167,7 +207,19 @@
          (fail c (format "~a.legend.~a" path k))))
      (score-answer 'score (need-real c a 'score path) legend probs
                    (need-real c a 'confidence path))]
-    [else (fail c (string-append path ".type"))]))
+    [("box")
+     (define b (need-hash c a 'box path))
+     (define bpath (string-append path ".box"))
+     (box-answer 'box
+                 (box-region (need-real c b 'top bpath) (need-real c b 'bottom bpath)
+                             (need-real c b 'left bpath) (need-real c b 'right bpath))
+                 ;; null is a legal confidence HERE and only here
+                 (optional-real c a 'confidence path))]
+    ;; an unknown type is a primitive newer than this client: skip it, say so,
+    ;; keep the rest of the response — never guess at its shape
+    [else
+     (log-jev-warning "jev: skipping answer ~s with unrecognized type ~s" id t)
+     #f]))
 
 ;; jsexpr -> response
 (define (parse-response body #:status [status 200] #:headers [headers '()] #:endpoint [endpoint "POST /v1/systemone"])
@@ -177,8 +229,9 @@
   (define answers (need-hash c body 'answers ""))
   (define u (need-hash c body 'usage ""))
   (response model
-            (for/hash ([(k v) (in-hash answers)])
-              (define id (symbol->string k))
-              (values id (parse-answer c id v)))
-            (usage (need-real c u 'input_tokens "usage")
-                   (need-real c u 'output_tokens "usage"))))
+            (for*/hash ([(k v) (in-hash answers)]
+                        [a (in-value (parse-answer c (symbol->string k) v))]
+                        #:when a)
+              (values (symbol->string k) a))
+            (usage (optional-real c u 'input_tokens "usage")
+                   (optional-real c u 'output_tokens "usage"))))

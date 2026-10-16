@@ -29,7 +29,7 @@
 
 (define DEFAULT-TIMEOUT 10.0)    ; seconds, one attempt
 (define DEFAULT-DEADLINE 30.0)   ; seconds, all attempts together
-(define USER-AGENT "jev-racket/0.1.0")
+(define USER-AGENT "jev-racket/0.2.0")
 
 ;; statuses : (or/c (listof exact-integer?) (-> exact-integer? boolean?))
 (struct retry-policy (max-retries backoff-initial backoff-max jitter statuses

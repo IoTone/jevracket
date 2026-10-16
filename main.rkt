@@ -30,7 +30,9 @@
          "private/answer.rkt"
          "private/client.rkt"
          "private/http.rkt"
-         "private/error.rkt")
+         "private/error.rkt"
+         "private/asset.rkt"
+         "private/jsonw.rkt")
 
 (provide
  ;; ---- asking ------------------------------------------------------------------
@@ -38,16 +40,22 @@
  ask ask/raw list-models (struct-out model-card)
 
  ;; ---- questions ---------------------------------------------------------------
- noul choice score
+ noul choice score locate
  (struct-out question)
  question->jsexpr questions->jsexpr
+ question->jobj questions->jobj (struct-out jobj) content->json content-ok?
  MAX-CHOICE-OPTIONS MIN-SCORE-LEVELS MAX-SCORE-LEVELS
+
+ ;; ---- images ------------------------------------------------------------------
+ image image? image-from-base64 image-reference
 
  ;; ---- answers -----------------------------------------------------------------
  (struct-out answer)
  (struct-out noul-answer)
  (struct-out choice-answer)
  (struct-out score-answer)
+ (struct-out box-answer)
+ (struct-out box-region)
  (struct-out usage)
  (struct-out response)
  answer-value answer-confidence answer-probabilities

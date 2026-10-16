@@ -108,13 +108,25 @@ with an absolute location must wrap it in `(file ...)`.
 (jev:ask c state (hash "team" (jev:choice ...)))
 ```
 
-## The three primitives
+## The four primitives
 
 | | Returns | Use it when |
 |---|---|---|
 | `(noul instructions #:yes #:no)` | probability of yes, 0 to 1 | the question has two answers |
 | `(choice instructions criteria)` | winner, per-option probabilities, confidence | one of a closed set, up to 255 |
-| `(score instructions criteria)` | weighted value, per-level probabilities, confidence | an ordered rubric, 2 to 10 levels |
+| `(score instructions criteria)` | weighted value, per-level probabilities, confidence | an ordered rubric, up to 10 levels |
+| `(locate instructions)` | a `box-region` in the request's image, confidence | finding something in an image |
+
+The vendor calls the fourth primitive **Box**, and so does the wire — the
+constructor is `locate` only because `box` is one of Racket's most basic names
+and shadowing it would break any module that uses boxes and this library
+together. It needs a model that can see (`jev-1.14.0` / `jev-preview`) and an
+image in the request — see "Images" below.
+
+`instructions` is optional on every type since the 0.7 API: a noul may be
+carried entirely by a described outcome — `(noul #:yes "the invoice is past its
+due date")` is a complete question — and a choice or score by its criteria.
+Pass `#f` (or nothing, for `noul` and `locate`) to omit it.
 
 `criteria` for a choice is a map of option to rubric, or `#f` where an option
 needs no explanation. An association list works too and keeps your ordering:
@@ -127,7 +139,14 @@ needs no explanation. An association list works too and keeps your ordering:
 ```
 
 `criteria` for a score is an ordered list, lowest level first. The order **is**
-the scale, which is the whole difference between a score and a choice.
+the scale, which is the whole difference between a score and a choice. The API
+accepts one to ten levels; two is where a score means anything.
+
+**Order is part of the question.** The questions map and a choice's options are
+JSON objects whose key order the model sees, and this client preserves the
+order you wrote — an association list of questions or options serializes
+exactly as listed (the vendor SDK does the same with Python dicts). Descriptions
+and levels may be strings, objects, arrays or images.
 
 `instructions` may also be a JSON object or array when the question needs to
 carry reference data:
@@ -139,6 +158,37 @@ carry reference data:
 
 Every documented limit is enforced at construction, so a bad question raises in
 Racket with a source location instead of costing a round trip and a 422.
+
+## Images
+
+An image rides OUTSIDE the JSON: the request becomes `multipart/form-data` with
+the JSON as a part named `request` and each image as its own raw-bytes part.
+This client builds all of that; you hand it `image` values:
+
+```racket
+(define photo (image (file->bytes "kitchen.png")))   ; bytes, or a path: (image "kitchen.png")
+
+(ask c (hasheq 'photo photo)                          ; images sit anywhere in state
+     (hash "mug"    (locate "the coffee mug in `photo`")
+           "is_tidy" (noul "Is the kitchen in `photo` tidy?"))
+     #:assets (list (cons "photo" photo))             ; names it, so questions can say `photo`
+     #:model "jev-preview")
+```
+
+- `(image data)` takes image file **bytes or a path**, read once on first use
+  and reused by every request that sends the same value. `image-from-base64`
+  takes base64 text, such as an upload. The content type is sniffed from the
+  file signature (PNG, JPEG) purely to label the part — the API detects formats
+  itself, so anything else still goes as generic binary data.
+- An image named in `#:assets` serializes as that id wherever it appears; an
+  anonymous one serializes as its unique reference and is uploaded under it.
+- **The API gates image requests behind an explicit opt-in** while the feature
+  is experimental. Pass the header yourself, which is also how the vendor SDK
+  does it:
+
+```racket
+(make-client #:headers '(("TypeSafe-Danger-Zone-Images" . "true")))
+```
 
 ## Reading answers
 
@@ -156,8 +206,16 @@ Two places this client deliberately improves on the wire:
   the parser into your contract.
 
 `answer-confidence` is `#f` for a noul. That is the API's shape, not an omission:
-a noul's probability already is its certainty. Treat `#f` as "not applicable",
-never as "unconfident".
+a noul's probability already is its certainty. A box's confidence may be `#f`
+too — there the wire allows `null`, meaning the model did not say. Treat `#f`
+as "not applicable", never as "unconfident".
+
+Two more wire facts the types carry: `usage` token counts the API did not
+report are `#f` rather than an error, and an answer whose `type` this client
+does not know is **skipped with a logged warning** rather than failing the
+response — the vendor SDK's forward-compatibility rule. A malformed answer of a
+known type still raises; that is a broken contract, not a new feature. The raw
+body is always available through `ask/raw`.
 
 **Confidence is the second axis.** The answer tells you what; the confidence
 tells you whether to act. The usual shape is to act above a threshold and route
@@ -210,6 +268,10 @@ Each attempt runs under its own custodian, so abandoning a stalled request also
 closes its socket. Racket's `http-sendrecv` has no timeout of its own, and
 without this a single stuck connection hangs the calling thread forever.
 
+Request bodies of 1 KiB or more are **gzipped** (the API accepts gzip and
+zstd; below one TCP segment there is nothing to win). `#:compress? #f` on
+`make-client` turns it off.
+
 ## Configuration
 
 | Variable | Default | |
@@ -226,7 +288,7 @@ schedule.
 ## Tests
 
 ```sh
-raco test test/*-tests.rkt        # 45 cases, no network
+raco test test/*-tests.rkt        # 69 cases, no network
 racket test/live-smoke.rkt        # one real request; needs a key
 ```
 
