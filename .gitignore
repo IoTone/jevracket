@@ -29,3 +29,6 @@ secrets.rkt
 .DS_Store
 .vscode/
 .idea/
+
+# Local Laya server venv (examples/README.md)
+.laya/
