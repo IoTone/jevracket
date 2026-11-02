@@ -26,7 +26,7 @@ probability-weighted value plus a confidence.
 (choice-answer-value (response-ref r "team"))     ; "technical"
 (answer-confidence   (response-ref r "team"))     ; 0.9
 (score-answer-value  (response-ref r "anger"))    ; 1.0
-(response-model r)                                ; "jev-1.13.0"
+(response-model r)                                ; "jev-1.14.0"
 ```
 
 All three questions above cost **one** request. Jev reads the state once and
@@ -120,8 +120,9 @@ with an absolute location must wrap it in `(file ...)`.
 The vendor calls the fourth primitive **Box**, and so does the wire — the
 constructor is `locate` only because `box` is one of Racket's most basic names
 and shadowing it would break any module that uses boxes and this library
-together. It needs a model that can see (`jev-1.14.0` / `jev-preview`) and an
-image in the request — see "Images" below.
+together. It needs a model that can see (`jev-1.14.0`, which `jev-latest` and
+`jev-preview` both point to as of October 2026) and an image in the request —
+see "Images" below.
 
 `instructions` is optional on every type since the 0.7 API: a noul may be
 carried entirely by a described outcome — `(noul #:yes "the invoice is past its
@@ -282,14 +283,69 @@ zstd; below one TCP segment there is nothing to win). `#:compress? #f` on
 
 `jev-latest` is an alias and it moves when the vendor ships. The response reports
 the versioned id that actually answered — log it. If you have tuned confidence
-thresholds, pass a pinned id such as `"jev-1.13.0"` and move on your own
-schedule.
+thresholds, pass a pinned id such as `"jev-1.14.0"` and move on your own
+schedule. (`jev-latest` moved from 1.13.0 to 1.14.0 on 2026-10-14.)
+
+## Self-hosting with Laya
+
+[Laya](https://github.com/NandhaKishorM/laya) is an independent, Apache-2.0
+System One engine from Convai Innovations, not a TypeSafe product. Its
+`laya-serve` answers `POST /v1/systemone` on the same wire, so this client can
+point at it unchanged:
+
+```racket
+(make-client #:base-url "http://127.0.0.1:8000"
+             #:api-key "unused"          ; any non-empty string, or LAYA_API_KEY's value
+             #:compress? #f)             ; required — see below
+```
+
+**On a Mac**, use [laya-mlx](https://github.com/mizorewww/laya-mlx), an
+independent port of the same weights to Apple's MLX that runs on the GPU. Its
+`laya-mlx-serve` is the same server, with the same environment variables:
+
+```sh
+uv venv -p 3.12 .laya && VIRTUAL_ENV=$PWD/.laya uv pip install 'laya-mlx[serve]'
+LAYA_HOST=127.0.0.1 LAYA_PORT=8765 LAYA_MODELS=english .laya/bin/laya-mlx-serve
+```
+
+The first start downloads the checkpoint (about 420 MB for English). Bind to
+127.0.0.1: the default host is `0.0.0.0`, and with no `LAYA_API_KEY` the server
+answers anyone. `laya-mlx-serve` has no `--help` flag. Any argument starts the
+server.
+
+Checked against laya 0.4.21 (source) and laya-mlx 0.6.0, which this client was
+run against live (`test/laya-smoke.rkt`). What differs from TypeSafe:
+
+- **Turn compression off.** laya-serve does not decode `Content-Encoding`, so any
+  body of 1 KiB or more that this client gzips comes back
+  `400 request body must be valid JSON`. The vendor's own 0.7.5 changelog warns
+  that non-official APIs may not take compressed bodies.
+- **Every question needs `instructions`.** The 0.7 API lets a noul ride on its
+  outcomes alone and a choice or score on criteria alone, but Laya refuses that
+  question with a 422.
+- **Text only.** No images, no `locate`/Box, no multipart.
+- **No `GET /v1/models`**, so `list-models` raises `exn:fail:jev:not-found`.
+- **`model`** names a Laya checkpoint (`"english"`, `"multilingual"`,
+  `"typed-decisions"`). A Jev id such as the default `jev-latest` means "let
+  Laya's router choose". The response's `model` is always `"laya-rl-agent"`.
+- **Confidence is a different number.** Laya's `confidence` is normalized
+  entropy, not Jev's formula, so a threshold tuned on Jev does not transfer.
+  laya-serve adds `x_jev_confidence` to each choice and score answer, which is
+  the Jev-equivalent value. Read it from `ask/raw`, because `ask` returns
+  `confidence`. Laya's other extras (`routing`, `answer_confidence`, `action`, a
+  wider `usage`) are ignored by the parser. Set `LAYA_JEV_STRICT=1` on the
+  server to strip them.
+- **Smaller limits:** 64 questions, 100 choice options (255 with
+  `LAYA_TOURNAMENT_GROUP`), 50,000 state characters, 2 MiB bodies. Breaking one
+  returns 413 or 422, which arrives as `exn:fail:jev:api`. An overloaded server
+  answers 503, and this client retries it.
 
 ## Tests
 
 ```sh
-raco test test/*-tests.rkt        # 69 cases, no network
+raco test test/*-tests.rkt        # 71 cases, no network
 racket test/live-smoke.rkt        # one real request; needs a key
+LAYA_BASE_URL=http://127.0.0.1:8765 racket test/laya-smoke.rkt   # needs a running Laya server
 ```
 
 The unit suite runs the client against a real socket
@@ -309,7 +365,9 @@ Findings from evaluating the service, not from using this client:
 - **It is hosted only.** There is no self-hosted Jev. Unlike an
   OpenAI-compatible model endpoint, which an operator can point at a local
   server, enabling this means state leaves the machine. Zero data retention is
-  an enterprise-plan option; the default is not ZDR.
+  an enterprise-plan option; the default is not ZDR. If state must stay local,
+  see "Self-hosting with Laya". That is a different model with its own
+  accuracy and calibration, not a local Jev.
 - **English is where it is strongest.** The vendor says other languages,
   including CJK, are handled but not equally well. In our own testing it still
   separated good from bad Japanese translations cleanly, but with a narrower
@@ -323,7 +381,10 @@ Findings from evaluating the service, not from using this client:
   is free, so a five-hundred-string quality pass costs about a cent. Latency
   measured 120 to 260ms per request.
 - **State is capped** at 32k tokens for the state plus the longest question, and
-  64k for everything together. Long documents need chunking.
+  64k for everything together. Long context raises both limits to 262k for each
+  request that sends `TypeSafe-Danger-Zone-Long-Context: true` (pass it with
+  `#:headers` on `ask`). It costs the same per token but is slower and less
+  accurate, so chunking is still the better default.
 
 ## License
 

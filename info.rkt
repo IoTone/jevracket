@@ -18,6 +18,6 @@
 (define deps '("base"))
 (define build-deps '("rackunit-lib"))
 
-;; `raco test` walks the package; these two are not unit tests. mock-api is a
+;; `raco test` walks the package; these three are not unit tests. mock-api is a
 ;; SERVER (it blocks), live-smoke spends real money against the real API.
-(define test-omit-paths '("test/mock-api.rkt" "test/live-smoke.rkt"))
+(define test-omit-paths '("test/mock-api.rkt" "test/live-smoke.rkt" "test/laya-smoke.rkt"))
