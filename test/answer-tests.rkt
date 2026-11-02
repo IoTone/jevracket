@@ -218,3 +218,59 @@ JSON
 (test-case "a legend value may be the structured level the caller sent"
   (define a (response-ref (parse "{\"model\":\"m\",\"answers\":{\"s\":{\"type\":\"score\",\"score\":0.5,\"legend\":{\"0\":\"calm\",\"1\":{\"tone\":\"hostile\"}},\"probabilities\":{\"0\":0.5,\"1\":0.5},\"confidence\":0.6}},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}") "s"))
   (check-equal? (hash-ref (score-answer-legend a) 1) (hasheq 'tone "hostile")))
+
+;; ---- Laya's laya-serve speaks the same wire (laya 0.4.21) --------------------------
+;;
+;; laya-serve (github.com/NandhaKishorM/laya) answers POST /v1/systemone with a
+;; Jev-shaped body plus extras: root `routing`, per-answer `answer_confidence`,
+;; `action` and `x_jev_confidence`, a noul `confidence`, and a wider `usage`.
+;; LAYA-RESPONSE is the sample in that repo's docs/http-api.md at v0.4.21,
+;; verbatim. The extras must not break parsing. Note what jev DOES return: Laya's
+;; `confidence` is normalized entropy, NOT Jev's formula; the Jev-equivalent
+;; number is `x_jev_confidence`, readable through ask/raw.
+
+(define LAYA-RESPONSE #<<JSON
+{
+  "model": "laya-rl-agent",
+  "answers": {
+    "queue": {"type": "choice", "choice": "billing",
+              "probabilities": {"billing": 0.9519, "tech": 0.0327, "other": 0.0154},
+              "confidence": 0.797, "answer_confidence": 0.9519,
+              "action": {"act_probability": 1.0}, "x_jev_confidence": 0.9278},
+    "urgency": {"type": "score", "score": 1.6994,
+                "legend": {"0": "calm", "1": "firm", "2": "angry", "3": "furious"},
+                "probabilities": {"0": 0.0249, "1": 0.4136, "2": 0.3985, "3": 0.1629},
+                "confidence": 0.1925, "answer_confidence": 0.4136,
+                "action": {"act_probability": 1.0}, "x_jev_confidence": 0.2507}
+  },
+  "usage": {"input_tokens": 83, "output_tokens": 0, "state_tokens": 12,
+            "state_tokens_dropped": 0, "truncated": false, "truncated_questions": []},
+  "routing": {"model": "english", "repo": "convaiinnovations/laya", "reason": "English Latin text",
+              "detection": {"script": "latin", "script_profile": {"latin": 1.0}, "language": "en",
+                            "is_english": true, "language_undecided": false, "diacritic_rate": 0.0,
+                            "non_latin_fraction": 0.0, "mixed_segment": null},
+              "workflow": null}
+}
+JSON
+  )
+
+(test-case "laya: a laya-serve response parses; its extra fields are ignored"
+  (define r (parse LAYA-RESPONSE))
+  (check-equal? (response-model r) "laya-rl-agent")
+  (check-equal? (response-ids r) '("queue" "urgency"))
+  (define q (response-ref r "queue"))
+  (check-equal? (choice-answer-value q) "billing")
+  (check-equal? (answer-confidence q) 0.797 "Laya's own confidence, not x_jev_confidence")
+  (define u (response-ref r "urgency"))
+  (check-equal? (score-answer-value u) 1.6994)
+  (check-equal? (hash-ref (score-answer-legend u) 3) "furious")
+  (check-equal? (hash-ref (score-answer-probabilities u) 1) 0.4136)
+  (check-equal? (usage-input-tokens (response-usage r)) 83)
+  (check-equal? (usage-output-tokens (response-usage r)) 0))
+
+(test-case "laya: a noul carrying confidence still reads as a bare probability"
+  ;; laya's agent.py adds `confidence` = max(p, 1-p) to a noul; the Jev contract
+  ;; has none, and answer-confidence stays #f for a noul either way
+  (define a (response-ref (parse "{\"model\":\"laya-rl-agent\",\"answers\":{\"n\":{\"type\":\"noul\",\"noul\":0.83,\"confidence\":0.83,\"answer_confidence\":0.83,\"action\":{\"act_probability\":1.0}}},\"usage\":{\"input_tokens\":9,\"output_tokens\":0}}") "n"))
+  (check-equal? (noul-answer-value a) 0.83)
+  (check-false (answer-confidence a)))
